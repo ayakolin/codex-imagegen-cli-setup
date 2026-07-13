@@ -1,0 +1,6 @@
+# never commit secrets or local codex state
+config.toml
+auth.json
+*.env
+.env
+imagegen-venv/
