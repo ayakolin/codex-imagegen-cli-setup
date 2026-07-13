@@ -9,10 +9,13 @@
 # over an API key (the built-in image_gen tool is only registered in ChatGPT
 # OAuth mode).
 #
-# This script contains NO secrets. The proxy base URL and API key are read from
-# the environment (CPA_BASE_URL / CPA_API_KEY, or OPENAI_BASE_URL /
-# OPENAI_API_KEY) or prompted interactively, and are written only into your
-# local Codex config ($CODEX_HOME/config.toml). Do not commit that file.
+# This script contains NO secrets. At runtime it reads:
+#   - the API key from Codex's own auth file ($CODEX_HOME/auth.json, field
+#     OPENAI_API_KEY), and
+#   - the base URL from the active provider in $CODEX_HOME/config.toml,
+# falling back to environment variables (CPA_API_KEY/CPA_BASE_URL or
+# OPENAI_API_KEY/OPENAI_BASE_URL) and finally to an interactive prompt.
+# Resolved values are written only into your local config.toml (never commit it).
 #
 # It sets up three pieces, idempotently:
 #   1. A shared Python venv with the `openai` SDK ($CODEX_HOME/imagegen-venv).
@@ -22,44 +25,85 @@
 #      OPENAI_BASE_URL / OPENAI_API_KEY into the CLI subprocess.
 #
 # Prerequisite: your Codex chat provider (pointing at the proxy with API-key
-# auth) is already configured in config.toml. This script does not touch it.
+# auth) is already configured and logged in. This script does not touch it.
 #
 # Usage:
-#   CPA_BASE_URL="https://your-proxy/v1" CPA_API_KEY="sk-..." ./setup-codex-imagegen.sh
-#   # or just run it and answer the prompts:
-#   ./setup-codex-imagegen.sh
+#   ./setup-codex-imagegen.sh                 # auto-reads key/base from Codex
+#   CPA_BASE_URL=... CPA_API_KEY=... ./setup-codex-imagegen.sh   # override
 
 set -euo pipefail
 
 CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
 CONFIG="$CODEX_HOME/config.toml"
+AUTH="$CODEX_HOME/auth.json"
 AGENTS="$CODEX_HOME/AGENTS.md"
 VENV_DIR="$CODEX_HOME/imagegen-venv"
 
 log() { printf '  %s\n' "$*"; }
 
-# --- resolve base url + api key (never hardcoded) ---------------------------
+PYBIN="$(command -v python3 || command -v python || true)"
+[ -n "$PYBIN" ] || { echo "error: python3/python not found on PATH" >&2; exit 1; }
+
+# --- readers (no secrets in the script) -------------------------------------
+read_json_field() { # $1=file $2=key -> prints value or fails
+  [ -f "$1" ] || return 1
+  if command -v jq >/dev/null 2>&1; then
+    local v; v="$(jq -re --arg k "$2" '.[$k] // empty' "$1" 2>/dev/null || true)"
+    [ -n "$v" ] && { printf '%s' "$v"; return 0; }
+  fi
+  "$PYBIN" - "$1" "$2" <<'PY'
+import json, sys
+try:
+    with open(sys.argv[1]) as f:
+        v = json.load(f).get(sys.argv[2])
+    sys.stdout.write(v) if v else sys.exit(1)
+except Exception:
+    sys.exit(1)
+PY
+}
+
+provider_base_url() { # prints active model_provider's base_url from config.toml
+  [ -f "$CONFIG" ] || return 1
+  "$PYBIN" - "$CONFIG" <<'PY'
+import sys
+try:
+    import tomllib
+except Exception:
+    sys.exit(1)
+try:
+    with open(sys.argv[1], "rb") as f:
+        d = tomllib.load(f)
+    p = d.get("model_provider")
+    u = (d.get("model_providers", {}).get(p) or {}).get("base_url", "")
+    sys.stdout.write(u) if u else sys.exit(1)
+except Exception:
+    sys.exit(1)
+PY
+}
+
+# --- resolve base url + api key ---------------------------------------------
+# Priority: explicit env override -> Codex's own files -> interactive prompt.
 BASE_URL="${CPA_BASE_URL:-${OPENAI_BASE_URL:-}}"
 API_KEY="${CPA_API_KEY:-${OPENAI_API_KEY:-}}"
 
-if [ -z "$BASE_URL" ]; then
+if [ -z "$BASE_URL" ]; then BASE_URL="$(provider_base_url || true)"; fi
+if [ -n "$BASE_URL" ]; then log "base URL: from ${CPA_BASE_URL:+env}${CPA_BASE_URL:-config.toml}"; else
   read -r -p "Proxy base URL (e.g. https://host/v1): " BASE_URL
 fi
-if [ -z "$API_KEY" ]; then
-  # -s so the key is not echoed to the terminal
+
+if [ -z "$API_KEY" ]; then API_KEY="$(read_json_field "$AUTH" OPENAI_API_KEY || true)"; fi
+if [ -n "$API_KEY" ]; then log "API key: loaded (${#API_KEY} chars)"; else
   read -r -s -p "API key: " API_KEY; printf '\n'
 fi
+
 if [ -z "$BASE_URL" ] || [ -z "$API_KEY" ]; then
-  echo "error: base URL and API key are both required" >&2
+  echo "error: could not resolve base URL / API key (set CPA_BASE_URL/CPA_API_KEY or log in to Codex first)" >&2
   exit 1
 fi
 
 mkdir -p "$CODEX_HOME"
 
-# --- pick a python + OS-specific venv interpreter path ----------------------
-PYBIN="$(command -v python3 || command -v python || true)"
-[ -n "$PYBIN" ] || { echo "error: python3/python not found on PATH" >&2; exit 1; }
-
+# --- OS-specific venv interpreter path --------------------------------------
 case "$(uname -s 2>/dev/null || echo unknown)" in
   MINGW*|MSYS*|CYGWIN*) VENV_PY="$VENV_DIR/Scripts/python.exe" ;;
   *)                    VENV_PY="$VENV_DIR/bin/python" ;;
@@ -82,7 +126,6 @@ echo "[2/3] standing instruction ($AGENTS)"
 BLOCK_BEGIN="<!-- BEGIN codex-imagegen-cli-fallback (managed by setup-codex-imagegen.sh) -->"
 BLOCK_END="<!-- END codex-imagegen-cli-fallback -->"
 
-# Drop any previous managed block so re-runs stay clean.
 if [ -f "$AGENTS" ]; then
   awk -v b="$BLOCK_BEGIN" -v e="$BLOCK_END" '
     $0==b {skip=1}
@@ -116,7 +159,7 @@ if grep -q 'shell_environment_policy' "$CONFIG" 2>/dev/null; then
   log "WARNING: [shell_environment_policy] already present; not editing it."
   log "Ensure its 'set' table includes:"
   log "  OPENAI_BASE_URL = \"$BASE_URL\""
-  log "  OPENAI_API_KEY  = \"<your key>\""
+  log "  OPENAI_API_KEY  = \"<key from $AUTH>\""
 else
   {
     printf '\n[shell_environment_policy]\n'

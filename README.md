@@ -14,7 +14,12 @@ This setup makes that fallback **automatic and self-contained**.
 2. Writes a standing instruction into `$CODEX_HOME/AGENTS.md` so plain "make me an image" requests go straight to the CLI fallback — no confirmation prompt.
 3. Adds a `[shell_environment_policy]` block to `config.toml` that injects `OPENAI_BASE_URL` / `OPENAI_API_KEY` into the CLI subprocess.
 
-It contains **no secrets**: the base URL and API key are read at runtime and written only into your local `~/.codex/config.toml` (which you should never commit).
+It contains **no secrets**. At runtime it resolves credentials automatically from Codex's own files:
+
+- **API key** ← `$CODEX_HOME/auth.json` (field `OPENAI_API_KEY`)
+- **Base URL** ← the active `model_provider`'s `base_url` in `$CODEX_HOME/config.toml`
+
+If either can't be found it falls back to env vars (`CPA_API_KEY`/`CPA_BASE_URL` or `OPENAI_API_KEY`/`OPENAI_BASE_URL`) and finally an interactive prompt. Resolved values are written only into your local `config.toml` (which you should never commit).
 
 ## Prerequisite
 
@@ -22,17 +27,17 @@ Your Codex **chat provider** (a custom `model_providers.*` pointing at the proxy
 
 ## Usage
 
-Non-interactive (recommended for automation):
+On a machine already logged in to Codex against the proxy, just run it — it reads the key and base URL from Codex's own files:
+
+```bash
+./setup-codex-imagegen.sh
+```
+
+To override (e.g. before logging in, or for automation):
 
 ```bash
 CPA_BASE_URL="https://YOUR-PROXY-HOST/v1" \
 CPA_API_KEY="sk-your-proxy-key" \
-./setup-codex-imagegen.sh
-```
-
-Interactive (prompts for both; the key is not echoed):
-
-```bash
 ./setup-codex-imagegen.sh
 ```
 
