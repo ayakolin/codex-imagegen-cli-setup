@@ -30,7 +30,8 @@ Your Codex **chat provider** (a custom `model_providers.*` pointing at the proxy
 On a machine already logged in to Codex against the proxy, just run it — it reads the key and base URL from Codex's own files:
 
 ```bash
-./setup-codex-imagegen.sh
+./setup-codex-imagegen.py
+# or: python3 setup-codex-imagegen.py
 ```
 
 To override (e.g. before logging in, or for automation):
@@ -38,7 +39,7 @@ To override (e.g. before logging in, or for automation):
 ```bash
 CPA_BASE_URL="https://YOUR-PROXY-HOST/v1" \
 CPA_API_KEY="sk-your-proxy-key" \
-./setup-codex-imagegen.sh
+./setup-codex-imagegen.py
 ```
 
 Then restart Codex and just ask: `draw a small orange cat on white and save it`.

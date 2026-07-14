@@ -4,3 +4,5 @@ auth.json
 *.env
 .env
 imagegen-venv/
+__pycache__/
+*.py[cod]
