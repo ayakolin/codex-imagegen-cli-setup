@@ -10,7 +10,7 @@ This setup makes that fallback **automatic and self-contained**.
 
 ## What the script does (idempotent)
 
-1. Creates a shared Python venv with the `openai` SDK at `$CODEX_HOME/imagegen-venv` (so every project reuses it instead of building a throwaway `.venv`).
+1. Points pip at the **Tsinghua PyPI mirror** (user-level `pip.conf` + venv-local config) and creates a shared Python venv with the `openai` SDK at `$CODEX_HOME/imagegen-venv` (so every project reuses it instead of building a throwaway `.venv`).
 2. Writes a standing instruction into `$CODEX_HOME/AGENTS.md` so plain "make me an image" requests go straight to the CLI fallback — no confirmation prompt.
 3. Adds a `[shell_environment_policy]` block to `config.toml` that injects `OPENAI_BASE_URL` / `OPENAI_API_KEY` into the CLI subprocess.
 
@@ -42,6 +42,27 @@ CPA_API_KEY="sk-your-proxy-key" \
 ./setup-codex-imagegen.py
 ```
 
+Partial modes (no Codex credentials needed):
+
+```bash
+# Only create the shared venv, switch its pip to Tsinghua, install openai
+./setup-codex-imagegen.py --venv-only
+
+# Only write user-level pip.conf -> Tsinghua PyPI
+./setup-codex-imagegen.py --pip-mirror
+
+# Force reinstall packages; skip writing user-level pip.conf
+./setup-codex-imagegen.py --venv-only --force-reinstall --no-user-pip
+```
+
+Override the mirror (defaults to Tsinghua):
+
+```bash
+PIP_INDEX_URL="https://mirrors.aliyun.com/pypi/simple/" \
+PIP_TRUSTED_HOST="mirrors.aliyun.com" \
+./setup-codex-imagegen.py --venv-only
+```
+
 Then restart Codex and just ask: `draw a small orange cat on white and save it`.
 
 ## Platform notes
@@ -49,6 +70,7 @@ Then restart Codex and just ask: `draw a small orange cat on white and save it`.
 - **Linux / macOS**: venv interpreter is `imagegen-venv/bin/python`.
 - **Windows (Git Bash / MSYS)**: the script detects it and uses `imagegen-venv/Scripts/python.exe`.
 - Requires `python3`/`python` on PATH and network access for the first `pip install openai`.
+- Default pip index: `https://pypi.tuna.tsinghua.edu.cn/simple`.
 
 ## Security
 

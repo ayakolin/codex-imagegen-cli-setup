@@ -18,7 +18,8 @@ OPENAI_API_KEY/OPENAI_BASE_URL) and finally to an interactive prompt.
 Resolved values are written only into your local config.toml (never commit it).
 
 It sets up three pieces, idempotently:
-  1. A shared Python venv with the `openai` SDK ($CODEX_HOME/imagegen-venv).
+  1. A shared Python venv with the `openai` SDK ($CODEX_HOME/imagegen-venv),
+     using Tsinghua PyPI as the default pip index for faster installs in CN.
   2. A standing instruction in $CODEX_HOME/AGENTS.md so plain "make an image"
      requests auto-run the CLI fallback without asking each time.
   3. A [shell_environment_policy] block in config.toml that injects
@@ -28,12 +29,15 @@ Prerequisite: your Codex chat provider (pointing at the proxy with API-key
 auth) is already configured and logged in. This script does not touch it.
 
 Usage:
-  ./setup-codex-imagegen.py                 # auto-reads key/base from Codex
+  ./setup-codex-imagegen.py                 # full setup (auto-reads key/base)
   CPA_BASE_URL=... CPA_API_KEY=... ./setup-codex-imagegen.py   # override
+  ./setup-codex-imagegen.py --venv-only     # only create venv + install deps
+  ./setup-codex-imagegen.py --pip-mirror    # only configure user pip -> Tsinghua
 """
 
 from __future__ import annotations
 
+import argparse
 import getpass
 import json
 import os
@@ -41,6 +45,7 @@ import platform
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 CODEX_HOME = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
@@ -48,6 +53,14 @@ CONFIG = CODEX_HOME / "config.toml"
 AUTH = CODEX_HOME / "auth.json"
 AGENTS = CODEX_HOME / "AGENTS.md"
 VENV_DIR = CODEX_HOME / "imagegen-venv"
+
+# Tsinghua University PyPI mirror (https://mirrors.tuna.tsinghua.edu.cn/help/pypi/)
+PIP_INDEX_URL = os.environ.get(
+    "PIP_INDEX_URL", "https://pypi.tuna.tsinghua.edu.cn/simple"
+)
+PIP_TRUSTED_HOST = os.environ.get("PIP_TRUSTED_HOST", "pypi.tuna.tsinghua.edu.cn")
+# Packages required by the imagegen skill CLI fallback
+VENV_PACKAGES = ("openai",)
 
 BLOCK_BEGIN = (
     "<!-- BEGIN codex-imagegen-cli-fallback "
@@ -57,11 +70,11 @@ BLOCK_END = "<!-- END codex-imagegen-cli-fallback -->"
 
 
 def log(msg: str) -> None:
-    print(f"  {msg}")
+    print(f"  {msg}", flush=True)
 
 
 def die(msg: str, code: int = 1) -> None:
-    print(f"error: {msg}", file=sys.stderr)
+    print(f"error: {msg}", file=sys.stderr, flush=True)
     sys.exit(code)
 
 
@@ -123,14 +136,12 @@ def venv_python(venv_dir: Path) -> Path:
     return venv_dir / "bin" / "python"
 
 
-def has_openai(py: Path) -> bool:
-    if not py.is_file() and not os.access(py, os.X_OK):
-        # On Windows, is_file() works; on Unix also check executable
-        if not py.exists():
-            return False
+def has_package(py: Path, package: str) -> bool:
+    if not py.exists():
+        return False
     try:
         r = subprocess.run(
-            [str(py), "-c", "import openai"],
+            [str(py), "-c", f"import {package}"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             check=False,
@@ -138,6 +149,10 @@ def has_openai(py: Path) -> bool:
         return r.returncode == 0
     except OSError:
         return False
+
+
+def has_openai(py: Path) -> bool:
+    return has_package(py, "openai")
 
 
 def openai_version(py: Path) -> str:
@@ -150,25 +165,188 @@ def openai_version(py: Path) -> str:
     return (r.stdout or "").strip() or "unknown"
 
 
-def ensure_venv(pybin: str, venv_dir: Path, venv_py: Path) -> None:
-    print(f"[1/3] shared venv ({venv_dir})")
-    if not has_openai(venv_py):
-        subprocess.run([pybin, "-m", "venv", str(venv_dir)], check=True)
-        # best-effort pip upgrade
+def pip_mirror_args() -> list[str]:
+    """Extra pip CLI args that force the Tsinghua (or override) index."""
+    return [
+        "-i",
+        PIP_INDEX_URL,
+        "--trusted-host",
+        PIP_TRUSTED_HOST,
+    ]
+
+
+def user_pip_config_path() -> Path:
+    """User-level pip.conf / pip.ini location (platform-aware)."""
+    system = platform.system().lower()
+    if system == "windows" or sys.platform.startswith(("win", "cygwin", "msys")):
+        appdata = os.environ.get("APPDATA")
+        if appdata:
+            return Path(appdata) / "pip" / "pip.ini"
+        return Path.home() / "pip" / "pip.ini"
+    # Linux / macOS: prefer XDG, fall back to ~/.pip/pip.conf
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    if xdg:
+        return Path(xdg) / "pip" / "pip.conf"
+    return Path.home() / ".config" / "pip" / "pip.conf"
+
+
+def venv_pip_config_path(venv_dir: Path) -> Path:
+    system = platform.system().lower()
+    if system == "windows" or sys.platform.startswith(("win", "cygwin", "msys")):
+        return venv_dir / "pip.ini"
+    # venv-local config: pip looks for pip.conf next to the config scheme;
+    # writing under venv/pip/pip.conf is reliable when PIP_CONFIG_FILE is set,
+    # but the common portable approach is the site-packages-adjacent conf
+    # via ensurepip's location. Prefer the well-known path under the venv.
+    return venv_dir / "pip.conf"
+
+
+def write_pip_config(path: Path) -> None:
+    """Write a pip config that defaults to the Tsinghua PyPI mirror."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    content = (
+        "[global]\n"
+        f"index-url = {PIP_INDEX_URL}\n"
+        f"trusted-host = {PIP_TRUSTED_HOST}\n"
+    )
+    path.write_text(content, encoding="utf-8")
+    log(f"pip mirror config: {path}")
+    log(f"  index-url = {PIP_INDEX_URL}")
+
+
+def configure_user_pip_mirror() -> Path:
+    """Configure the current user's pip to use the Tsinghua mirror."""
+    path = user_pip_config_path()
+    write_pip_config(path)
+    return path
+
+
+def configure_venv_pip_mirror(venv_dir: Path, venv_py: Path) -> None:
+    """Pin the venv's pip to the Tsinghua mirror via config + env-friendly conf."""
+    # pip inside a venv reads $VIRTUAL_ENV/pip.conf on some layouts; also
+    # drop a conf that we can point at with PIP_CONFIG_FILE during installs.
+    conf = venv_pip_config_path(venv_dir)
+    write_pip_config(conf)
+    # Additionally set via `pip config` so the venv itself remembers it.
+    try:
         subprocess.run(
-            [str(venv_py), "-m", "pip", "install", "--quiet", "--upgrade", "pip"],
+            [
+                str(venv_py),
+                "-m",
+                "pip",
+                "config",
+                "--site",
+                "set",
+                "global.index-url",
+                PIP_INDEX_URL,
+            ],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             check=False,
         )
         subprocess.run(
-            [str(venv_py), "-m", "pip", "install", "--quiet", "openai"],
+            [
+                str(venv_py),
+                "-m",
+                "pip",
+                "config",
+                "--site",
+                "set",
+                "global.trusted-host",
+                PIP_TRUSTED_HOST,
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    except OSError:
+        pass
+
+
+def run_pip(
+    venv_py: Path,
+    args: list[str],
+    *,
+    quiet: bool = True,
+    check: bool = True,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Run `python -m pip ...` inside the venv with the Tsinghua mirror."""
+    # Always force mirror on the CLI so it wins over any global config.
+    if args and args[0] in ("install", "download", "wheel"):
+        cmd = [str(venv_py), "-m", "pip", args[0], *pip_mirror_args(), *args[1:]]
+    else:
+        cmd = [str(venv_py), "-m", "pip", *args]
+
+    run_env = os.environ.copy()
+    if env:
+        run_env.update(env)
+    # venv_py is .../bin/python or .../Scripts/python.exe -> venv root is parent.parent
+    conf = venv_pip_config_path(venv_py.parent.parent)
+    if conf.is_file():
+        run_env.setdefault("PIP_CONFIG_FILE", str(conf))
+
+    kwargs: dict = {
+        "check": check,
+        "text": True,
+        "env": run_env,
+    }
+    if quiet:
+        kwargs["stdout"] = subprocess.DEVNULL
+        kwargs["stderr"] = subprocess.DEVNULL
+    return subprocess.run(cmd, **kwargs)
+
+
+def ensure_venv(
+    pybin: str,
+    venv_dir: Path,
+    venv_py: Path,
+    *,
+    force_reinstall: bool = False,
+    step_label: str = "[1/3]",
+) -> None:
+    """Create the shared venv (if needed), switch pip to Tsinghua, install deps."""
+    print(f"{step_label} shared venv ({venv_dir})", flush=True)
+
+    if not venv_py.exists():
+        log(f"creating venv with {pybin}")
+        subprocess.run([pybin, "-m", "venv", str(venv_dir)], check=True)
+        if not venv_py.exists():
+            die(f"venv created but interpreter missing: {venv_py}")
+        log(f"venv ready: {venv_py}")
+    else:
+        log(f"venv already exists: {venv_py}")
+
+    # Always (re)apply Tsinghua mirror so re-runs stay consistent
+    log(f"configuring pip mirror -> {PIP_INDEX_URL}")
+    configure_venv_pip_mirror(venv_dir, venv_py)
+
+    # Ensure pip itself is present and reasonably fresh (via mirror)
+    log("upgrading pip (via Tsinghua mirror)")
+    run_pip(
+        venv_py,
+        ["install", "--upgrade", "pip", "setuptools", "wheel"],
+        quiet=True,
+        check=False,
+    )
+
+    missing = [p for p in VENV_PACKAGES if force_reinstall or not has_package(venv_py, p)]
+    if missing:
+        log(f"installing dependencies: {', '.join(missing)}")
+        run_pip(
+            venv_py,
+            ["install", *(["--force-reinstall"] if force_reinstall else []), *missing],
+            quiet=False,
             check=True,
         )
-        log("installed openai")
+        log(f"installed: {', '.join(missing)}")
     else:
-        log("openai already present, skipping install")
-    log(f"openai version: {openai_version(venv_py)}")
+        log(f"dependencies already present: {', '.join(VENV_PACKAGES)} (skip install)")
+
+    if has_openai(venv_py):
+        log(f"openai version: {openai_version(venv_py)}")
+    else:
+        die("openai import still fails after install; check network / mirror")
 
 
 def strip_managed_block(text: str, begin: str, end: str) -> str:
@@ -204,7 +382,7 @@ For ANY request to generate, create, draw, edit, or produce an image / picture /
 
 
 def write_agents_md(agents_path: Path, venv_py: Path) -> None:
-    print(f"[2/3] standing instruction ({agents_path})")
+    print(f"[2/3] standing instruction ({agents_path})", flush=True)
     existing = ""
     if agents_path.is_file():
         existing = agents_path.read_text(encoding="utf-8")
@@ -231,7 +409,7 @@ def write_agents_md(agents_path: Path, venv_py: Path) -> None:
 
 
 def inject_shell_env_policy(config_path: Path, base_url: str, api_key: str) -> None:
-    print(f"[3/3] env injection ({config_path})")
+    print(f"[3/3] env injection ({config_path})", flush=True)
     if not config_path.exists():
         config_path.touch()
 
@@ -259,22 +437,25 @@ def dry_run_check(venv_py: Path) -> None:
     if not skill_cli.is_file():
         log(f"note: imagegen skill not found yet at {skill_cli} (Codex provisions it on first use)")
         return
+    # Use the platform temp dir so this works on Windows (no /tmp) as well as Unix.
     try:
-        r = subprocess.run(
-            [
-                str(venv_py),
-                str(skill_cli),
-                "generate",
-                "--prompt",
-                "wiring check",
-                "--out",
-                "/tmp/imagegen-drycheck.png",
-                "--dry-run",
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
+        with tempfile.TemporaryDirectory(prefix="codex-imagegen-") as tmp:
+            out = Path(tmp) / "imagegen-drycheck.png"
+            r = subprocess.run(
+                [
+                    str(venv_py),
+                    str(skill_cli),
+                    "generate",
+                    "--prompt",
+                    "wiring check",
+                    "--out",
+                    str(out),
+                    "--dry-run",
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
         if r.returncode == 0:
             log("dry-run wiring check: OK")
         else:
@@ -321,22 +502,84 @@ def resolve_credentials() -> tuple[str, str]:
     return base_url, api_key
 
 
-def main() -> None:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description=(
+            "Set up Codex CLI imagegen fallback: shared venv (Tsinghua pip), "
+            "AGENTS.md instruction, and shell env injection."
+        )
+    )
+    p.add_argument(
+        "--venv-only",
+        action="store_true",
+        help="Only create the shared venv, set pip to Tsinghua, and install deps",
+    )
+    p.add_argument(
+        "--pip-mirror",
+        action="store_true",
+        help="Only write the user-level pip config pointing at Tsinghua PyPI",
+    )
+    p.add_argument(
+        "--force-reinstall",
+        action="store_true",
+        help="Force reinstall of venv packages even if already present",
+    )
+    p.add_argument(
+        "--no-user-pip",
+        action="store_true",
+        help="Do not also write the user-level pip.conf (venv-local only)",
+    )
+    return p.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> None:
+    args = parse_args(argv)
     pybin = find_python()
-    base_url, api_key = resolve_credentials()
+
+    # --pip-mirror alone: only touch user-level pip.conf, then exit
+    if args.pip_mirror and not args.venv_only:
+        print("[pip] configure user pip mirror (Tsinghua)", flush=True)
+        configure_user_pip_mirror()
+        print(flush=True)
+        print(f"Done. pip will use {PIP_INDEX_URL}", flush=True)
+        return
 
     CODEX_HOME.mkdir(parents=True, exist_ok=True)
     venv_py = venv_python(VENV_DIR)
 
-    ensure_venv(pybin, VENV_DIR, venv_py)
+    # Full setup: also pin user pip to Tsinghua (skip with --no-user-pip).
+    # --venv-only stays venv-scoped only.
+    if not args.venv_only and not args.no_user_pip:
+        print("[0/3] user pip mirror (Tsinghua)", flush=True)
+        configure_user_pip_mirror()
+
+    step = "[1/1]" if args.venv_only else "[1/3]"
+    ensure_venv(
+        pybin,
+        VENV_DIR,
+        venv_py,
+        force_reinstall=args.force_reinstall,
+        step_label=step,
+    )
+
+    if args.venv_only:
+        print(flush=True)
+        print(f"Done. Shared venv ready at {VENV_DIR}", flush=True)
+        print(f"  interpreter: {venv_py}", flush=True)
+        print(f"  pip index:   {PIP_INDEX_URL}", flush=True)
+        return
+
+    # Full setup: credentials + agents + config
+    base_url, api_key = resolve_credentials()
     write_agents_md(AGENTS, venv_py)
     inject_shell_env_policy(CONFIG, base_url, api_key)
     dry_run_check(venv_py)
 
-    print()
+    print(flush=True)
     print(
-        'Done. Restart Codex if it is running. '
-        'Then just ask, e.g. "draw a red star and save it".'
+        "Done. Restart Codex if it is running. "
+        'Then just ask, e.g. "draw a red star and save it".',
+        flush=True,
     )
 
 
